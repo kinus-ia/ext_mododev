@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "modo dev",
+  "version": "0.3.0",
+  "description": "Anota na tela + print → Claude Code edita o código do projeto (via daemon modo-dev). Painel lateral mostra o que o CLI tá fazendo em tempo real.",
+  "permissions": ["scripting", "activeTab", "storage", "sidePanel"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "modo dev" },
+  "side_panel": { "default_path": "painel.html" }
+}
