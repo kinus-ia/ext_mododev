@@ -52,31 +52,106 @@ function emitir(tipo: EventoDev["tipo"], payload: unknown): void {
 // Injeção no terminal do Claude Code: cola texto no input + Enter via osascript.
 // Em modo chat (MODODEV_MODO=chat), quando o print chega, em vez de só salvar
 // e esperar você dizer "lê", o daemon ativa o terminal e cola direto pra você.
+//
+// Como acha a aba CERTA (mesmo Terminal tendo várias janelas/abas):
+//  1. Lê ~/.claude/sessions/*.json — cada arquivo descreve uma sessão Claude Code
+//     ativa com {pid, cwd}.
+//  2. Filtra pelas que têm cwd === PROJETO (o cwd do daemon).
+//  3. Pega o ppid do claude → é o shell que o hospeda. O tty desse shell = tty da
+//     aba do Terminal.
+//  4. AppleScript percorre todas as abas do Terminal e seleciona a que tem o tty
+//     que bate. Só aí dispara cmd+v + Enter.
+// Sem isso, o keystroke iria pra aba frontmost — que pode ser de outro projeto.
+//
 // Configurável via MODODEV_TERM_APP (default: Terminal). Pra desligar, defina
 // MODODEV_INJETAR=off — aí volta ao save-only.
 // ---------------------------------------------------------------------------
 const TERM_APP = process.env["MODODEV_TERM_APP"] || "Terminal";
 const INJETAR_ATIVO = (process.env["MODODEV_INJETAR"] || "on").toLowerCase() !== "off";
 
+async function pidVivo(pid: number): Promise<boolean> {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function rodar(cmd: string[]): Promise<string> {
+  const p = Bun.spawn(cmd, { stdout: "pipe", stderr: "ignore" });
+  const t = await new Response(p.stdout).text();
+  await p.exited;
+  return t.trim();
+}
+
+async function acharTtyDaSessaoClaude(): Promise<string | null> {
+  const sessoesDir = path.join(process.env["HOME"] || "", ".claude", "sessions");
+  if (!existsSync(sessoesDir)) return null;
+  const { readdirSync } = await import("fs");
+  for (const f of readdirSync(sessoesDir)) {
+    if (!f.endsWith(".json")) continue;
+    try {
+      const dados = JSON.parse(readFileSync(path.join(sessoesDir, f), "utf-8")) as { pid?: number; cwd?: string };
+      if (dados.cwd !== PROJETO) continue;
+      const pidClaude = Number(dados.pid);
+      if (!pidClaude || !(await pidVivo(pidClaude))) continue;
+      const ppid = Number(await rodar(["ps", "-p", String(pidClaude), "-o", "ppid="]));
+      if (!ppid) continue;
+      const tty = await rodar(["ps", "-p", String(ppid), "-o", "tty="]);
+      if (!tty || tty === "??" || tty === "?") continue;
+      return tty.startsWith("/dev/") ? tty : `/dev/${tty}`;
+    } catch { /* ignora json corrompido */ }
+  }
+  return null;
+}
+
 async function injetarNoTerminal(texto: string): Promise<void> {
   if (!INJETAR_ATIVO) return;
+  const tty = await acharTtyDaSessaoClaude();
+  if (!tty) {
+    console.warn(`[modo-dev] nenhum Claude Code aberto com cwd=${PROJETO}. Print foi salvo, mas sem injeção.`);
+    return;
+  }
   const escapado = texto.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\r?\n/g, "\\n");
+  // ATENÇÃO: este AppleScript é específico pro Terminal.app. iTerm2/Warp/Hyper
+  // usam APIs diferentes — pra suportar, ramificar pelo TERM_APP aqui.
   const script = `
+set targetTTY to "${tty}"
 set the clipboard to "${escapado}"
-tell application "${TERM_APP}" to activate
-delay 0.25
-tell application "System Events"
-  keystroke "v" using command down
-  delay 0.12
-  key code 36
+set achou to false
+tell application "${TERM_APP}"
+  activate
+  repeat with w in windows
+    if achou then exit repeat
+    repeat with t in tabs of w
+      try
+        if (tty of t) is targetTTY then
+          set selected of t to true
+          set frontmost of w to true
+          set achou to true
+          exit repeat
+        end if
+      end try
+    end repeat
+  end repeat
 end tell
+if achou then
+  delay 0.18
+  tell application "System Events"
+    keystroke "v" using command down
+    delay 0.12
+    key code 36
+  end tell
+  return "OK"
+else
+  return "NOTFOUND"
+end if
   `.trim();
   try {
-    const proc = Bun.spawn(["osascript", "-e", script], { stdout: "ignore", stderr: "pipe" });
+    const proc = Bun.spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
     const code = await proc.exited;
-    if (code !== 0) {
+    const out = (await new Response(proc.stdout).text()).trim();
+    if (code !== 0 || out !== "OK") {
       const err = await new Response(proc.stderr).text();
-      console.warn(`[modo-dev] osascript exit ${code}: ${err.slice(0, 200)}`);
+      console.warn(`[modo-dev] osascript: exit=${code} out=${out} err=${err.slice(0, 200)}`);
+    } else {
+      console.log(`[modo-dev] injetado em ${tty}`);
     }
   } catch (e) {
     console.error("[modo-dev] osascript falhou:", e);
